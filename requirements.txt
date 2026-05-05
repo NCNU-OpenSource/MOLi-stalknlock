@@ -25,5 +25,8 @@ RPi.GPIO==0.7.1
 bcrypt==4.1.2
 python-jose[cryptography]==3.3.0
 
+# Rate limiting
+slowapi==0.1.9
+
 # Timezone
 pytz==2024.1

@@ -1,30 +1,110 @@
-from fastapi import APIRouter, Depends, HTTPException, Cookie, BackgroundTasks, Form
-from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
-from typing import Optional, List
-import pytz
-import logging
-import requests
-from datetime import datetime, timedelta
+import asyncio
 
-from app.database import get_db, User, Card, Admin, AccessLog, generate_uuid
+from fastapi import APIRouter, Depends, HTTPException, Cookie, BackgroundTasks, Form
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from typing import Optional, List
+import logging
+from datetime import timedelta
+
+from app.database import get_db, User, Card, Admin, AccessLog, DoorEvent, generate_uuid
+from app.routers.dependencies import get_current_admin
+from app.services.card_uid import CardUIDNormalizationError, normalize_card_uid_input
+from app.services.door_mode import (
+    MODE_NORMAL,
+    can_defer_mode_switch,
+    get_access_mode_label,
+    get_weekday_label,
+    normalize_access_mode,
+    normalize_weekday_mode_overrides,
+    resolve_effective_access_mode,
+    serialize_door_settings,
+    serialize_weekday_mode_overrides,
+    sync_door_hardware_state,
+    validate_schedule_config,
+)
+from app.services.registration import start_registration_session
 from app.services.telegram import send_telegram
-from app.services.gpio_control import open_lock
-from app.services.auth import verify_access_token, hash_password
+from app.services.gpio_control import open_lock, get_lock_runtime_status
+from app.services.auth import hash_password
+from app.services.rfid_reader import rfid_reader
+from app.config import DEV_MODE, LOCK_DURATION
+from app.timezone import app_time_to_utc_naive, now_app_timezone, serialize_datetime
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-def get_current_admin(token: Optional[str] = Cookie(None, alias="admin_token")) -> dict:
-    """驗證管理員身份，未登入則拋出 401"""
-    if not token:
-        raise HTTPException(401, "請先登入")
+APPLY_TIMING_IMMEDIATE = "immediate"
+APPLY_TIMING_NEXT_CYCLE = "next_cycle"
 
-    admin = verify_access_token(token)
-    if not admin:
-        raise HTTPException(401, "登入已過期")
 
-    return admin
+def _build_door_status_payload(db: Session) -> dict:
+    settings, evaluation, _ = sync_door_hardware_state(db)
+
+    last_remote_unlock = db.query(DoorEvent).filter(
+        DoorEvent.action == "remote_unlock"
+    ).order_by(DoorEvent.created_at.desc()).first()
+
+    remote_unlock_count = db.query(func.count(DoorEvent.id)).filter(
+        DoorEvent.action == "remote_unlock"
+    ).scalar()
+
+    status = get_lock_runtime_status()
+    status.update(serialize_door_settings(settings, evaluation))
+    status.update({
+        "dev_mode": DEV_MODE,
+        "rfid_reader_mode": "dev" if rfid_reader.dev_mode else "hardware",
+        "rfid_device_connected": True if rfid_reader.dev_mode else rfid_reader.device is not None,
+        "rfid_device_path": None if rfid_reader.dev_mode else rfid_reader.device_path,
+        "can_simulate_scan": DEV_MODE and rfid_reader.dev_mode,
+        "last_remote_unlock_at": serialize_datetime(last_remote_unlock.created_at) if last_remote_unlock else None,
+        "last_remote_unlock_by": last_remote_unlock.admin_name if last_remote_unlock else None,
+        "remote_unlock_count": remote_unlock_count or 0,
+    })
+
+    return status
+
+
+def _get_mode_source_label(active_mode_source: str, weekday_key: str) -> str:
+    if active_mode_source == "weekday_override":
+        return f"{get_weekday_label(weekday_key)}規則"
+    return "預設模式"
+
+
+def _count_weekday_overrides(weekday_mode_overrides: dict[str, str | None]) -> int:
+    return sum(1 for mode in weekday_mode_overrides.values() if mode is not None)
+
+
+def _describe_door_mode(
+    default_access_mode: str,
+    effective_access_mode: str,
+    active_mode_source: str,
+    weekday_key: str,
+    daily_lock_time: str,
+    first_unlock_time: str,
+    weekday_mode_overrides: dict[str, str | None],
+) -> str:
+    override_count = _count_weekday_overrides(weekday_mode_overrides)
+    return (
+        f"已更新門禁規則：預設模式 {get_access_mode_label(default_access_mode)}；"
+        f"今日依 {_get_mode_source_label(active_mode_source, weekday_key)} 生效為 {get_access_mode_label(effective_access_mode)}；"
+        f"星期別覆蓋 {override_count} 天；共用時段 {first_unlock_time}-{daily_lock_time}。"
+    )
+
+
+def _describe_scheduled_mode_change(
+    current_access_mode: str,
+    current_active_mode_source: str,
+    next_access_mode: str,
+    next_active_mode_source: str,
+    weekday_key: str,
+    daily_lock_time: str,
+) -> str:
+    return (
+        f"今日已常開，門禁將於 {daily_lock_time} 上鎖後，"
+        f"把 {_get_mode_source_label(current_active_mode_source, weekday_key)} 的 {get_access_mode_label(current_access_mode)} "
+        f"切換為 {_get_mode_source_label(next_active_mode_source, weekday_key)} 的 {get_access_mode_label(next_access_mode)}。"
+    )
 
 @router.get("/users")
 async def list_users(
@@ -46,7 +126,7 @@ async def list_users(
             "telegram_id": u.telegram_id,
             "is_active": u.is_active,
             "card_count": card_count,
-            "created_at": u.created_at.isoformat() if u.created_at else None
+            "created_at": serialize_datetime(u.created_at)
         })
 
     return result
@@ -108,7 +188,7 @@ async def list_user_cards(
         "nickname": c.nickname,
         "user_id": c.user_id,
         "is_active": c.is_active,
-        "created_at": c.created_at.isoformat() if c.created_at else None
+        "created_at": serialize_datetime(c.created_at)
     } for c in cards]
 
 @router.get("/cards")
@@ -131,7 +211,7 @@ async def list_all_cards(
             "is_active": c.is_active,
             "user_name": user.name if user else "未知",
             "student_id": user.student_id if user else "N/A",
-            "created_at": c.created_at.isoformat() if c.created_at else None
+            "created_at": serialize_datetime(c.created_at)
         })
 
     return result
@@ -139,7 +219,8 @@ async def list_all_cards(
 @router.post("/cards")
 async def create_card(
     user_id: str = Form(...),
-    rfid_uid: str = Form(...),
+    rfid_uid: Optional[str] = Form(None),
+    ios_scan_text: Optional[str] = Form(None),
     nickname: Optional[str] = Form(None),
     background_tasks: BackgroundTasks = None,
     admin_token: Optional[str] = Cookie(None),
@@ -153,56 +234,78 @@ async def create_card(
     if not user:
         raise HTTPException(404, "使用者不存在")
 
+    try:
+        normalized_rfid_uid = normalize_card_uid_input(rfid_uid, ios_scan_text)
+    except CardUIDNormalizationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
     # 檢查 RFID UID 是否已被使用
-    existing = db.query(Card).filter(Card.rfid_uid == rfid_uid).first()
+    existing = db.query(Card).filter(Card.rfid_uid == normalized_rfid_uid).first()
     if existing:
         raise HTTPException(400, "此卡片 UID 已被使用")
 
     card = Card(
         id=generate_uuid(),
-        rfid_uid=rfid_uid,
+        rfid_uid=normalized_rfid_uid,
         user_id=user_id,
         nickname=nickname
     )
     db.add(card)
     db.commit()
 
-    log.info(f"💳 Admin {current_admin['name']} created card for {user.name}: {rfid_uid}")
+    log.info(f"💳 Admin {current_admin['name']} created card for {user.name}: {normalized_rfid_uid}")
 
     # 背景發送通知
     if background_tasks:
-        message = f"💳 新增卡片：{user.name} ({user.student_id})\nRFID: {rfid_uid}\n操作者：{current_admin['name']}"
+        message = f"💳 新增卡片：{user.name} ({user.student_id})\nRFID: {normalized_rfid_uid}\n操作者：{current_admin['name']}"
         background_tasks.add_task(send_telegram, message)
 
-    return {"message": "卡片已新增", "card_id": card.id}
+    return {
+        "message": "卡片已新增",
+        "card_id": card.id,
+        "rfid_uid": normalized_rfid_uid,
+    }
 
 @router.post("/cards/bind")
 async def start_card_binding(
     user_id: str = Form(...),
+    nickname: Optional[str] = Form(None),
     admin_token: Optional[str] = Cookie(None),
     db: Session = Depends(get_db)
 ):
-    """啟動刷卡綁定模式（為指定使用者綁定新卡片）"""
+    """啟動刷卡綁定模式（為指定使用者綁定新卡片）
+
+    **重構說明**：
+    - 移除 HTTP 呼叫 `/mode/register`
+    - 直接操作資料庫（與 main.py 邏輯一致）
+    - 支援卡片別名參數
+    """
     current_admin = get_current_admin(admin_token)
 
+    # 查詢使用者
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(404, "使用者不存在")
 
-    # 呼叫 /mode/register 切換模式
-    try:
-        response = requests.post(
-            "http://localhost:8000/mode/register",
-            params={"student_id": user.student_id}
+    session, conflicting_session = start_registration_session(db, user.id, nickname)
+    if conflicting_session:
+        owner = conflicting_session.user
+        owner_label = (
+            f"{owner.name} ({owner.student_id})"
+            if owner else conflicting_session.user_id
         )
-        response.raise_for_status()
-    except Exception as e:
-        log.error(f"Failed to start card binding mode: {e}")
-        raise HTTPException(500, "無法啟動刷卡綁定模式")
+        raise HTTPException(
+            status_code=409,
+            detail=f"已有其他綁定流程進行中：{owner_label}",
+        )
 
-    log.info(f"🔗 Admin {current_admin['name']} started card binding for {user.name} ({user.student_id})")
+    log.info(f"🔗 Admin {current_admin['name']} started card binding for {user.name} ({user.student_id}), nickname: {nickname or 'N/A'}")
 
-    return {"message": "請在90秒內刷卡兩次完成綁定", "student_id": user.student_id}
+    return {
+        "message": "請在90秒內刷卡兩次完成綁定（既有有效卡仍可正常通行）",
+        "student_id": user.student_id,
+        "initial_card_count": session.initial_card_count,
+    }
 
 @router.delete("/users/{user_id}")
 async def delete_user(
@@ -377,7 +480,7 @@ async def list_admins(
         "id": a.id,
         "username": a.username,
         "name": a.name,
-        "created_at": a.created_at.isoformat() if a.created_at else None
+        "created_at": serialize_datetime(a.created_at)
     } for a in admins]
 
 @router.post("/admins")
@@ -427,13 +530,22 @@ async def update_admin(
         raise HTTPException(404, "管理員不存在")
 
     old_name = admin.name
+    updated = False
 
-    if name:
+    if name is not None:
+        name = name.strip()
+        if not name:
+            raise HTTPException(400, "姓名不能為空白")
         admin.name = name
+        updated = True
+    if password is not None:
+        password = password.strip()
     if password:
         admin.password_hash = hash_password(password)
+        updated = True
 
-    db.commit()
+    if updated:
+        db.commit()
 
     log.info(f"✏️ Admin {current_admin['name']} updated admin: {old_name} → {admin.name}")
 
@@ -475,13 +587,51 @@ async def delete_admin(
 @router.post("/door/unlock")
 async def remote_unlock(
     background_tasks: BackgroundTasks,
-    admin_token: Optional[str] = Cookie(None)
+    admin_token: Optional[str] = Cookie(None),
+    db: Session = Depends(get_db)
 ):
     """遠程開門"""
     current_admin = get_current_admin(admin_token)
+    current_status = _build_door_status_payload(db)
 
-    # 立即開門
-    open_lock()
+    if current_status["door_state"] == "held_open":
+        event = DoorEvent(
+            admin_id=current_admin["id"],
+            admin_name=current_admin["name"],
+            action="remote_unlock",
+            source="door_control_ui",
+            result="accepted",
+            description="門目前已維持解鎖，略過額外開門請求。",
+        )
+        db.add(event)
+        db.commit()
+        return {
+            "message": "門目前已維持解鎖",
+            "event_id": event.id,
+            "lock_duration_seconds": LOCK_DURATION,
+            "status": current_status,
+        }
+
+    if current_status["door_state"] == "unlocking":
+        return {
+            "message": "門目前正在開啟中",
+            "lock_duration_seconds": LOCK_DURATION,
+            "status": current_status,
+        }
+
+    # 非阻塞地觸發開門，避免卡住整個事件迴圈
+    asyncio.create_task(asyncio.to_thread(open_lock))
+
+    event = DoorEvent(
+        admin_id=current_admin["id"],
+        admin_name=current_admin["name"],
+        action="remote_unlock",
+        source="door_control_ui",
+        result="accepted",
+        description=f"遠程開門請求已送出，預計持續 {LOCK_DURATION} 秒",
+    )
+    db.add(event)
+    db.commit()
 
     # 背景發送通知
     message = f"🚪 遠程開門操作\n操作者：{current_admin['name']}"
@@ -489,7 +639,217 @@ async def remote_unlock(
 
     log.info(f"🚪 Admin {current_admin['name']} triggered remote unlock")
 
-    return {"message": "門已開啟"}
+    return {
+        "message": "門已開啟",
+        "event_id": event.id,
+        "lock_duration_seconds": LOCK_DURATION,
+        "status": _build_door_status_payload(db),
+    }
+
+
+@router.put("/door/settings")
+async def update_door_settings(
+    access_mode: str = Form(...),
+    weekday_mode_overrides: Optional[str] = Form(None),
+    daily_lock_time: Optional[str] = Form(None),
+    first_unlock_time: Optional[str] = Form(None),
+    apply_timing: str = Form(APPLY_TIMING_IMMEDIATE),
+    background_tasks: BackgroundTasks = None,
+    admin_token: Optional[str] = Cookie(None),
+    db: Session = Depends(get_db)
+):
+    """更新門禁模式與每日首刷常開排程。"""
+    current_admin = get_current_admin(admin_token)
+
+    if apply_timing not in {APPLY_TIMING_IMMEDIATE, APPLY_TIMING_NEXT_CYCLE}:
+        raise HTTPException(400, "不支援的套用時機")
+
+    try:
+        normalized_access_mode = normalize_access_mode(access_mode) or MODE_NORMAL
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    try:
+        normalized_daily_lock_time, normalized_first_unlock_time = validate_schedule_config(
+            daily_lock_time,
+            first_unlock_time,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    settings, evaluation, _ = sync_door_hardware_state(db)
+    now_local = evaluation.now_local
+    current_daily_lock_time = settings.daily_lock_time or normalized_daily_lock_time
+    current_first_unlock_time = settings.first_unlock_time or normalized_first_unlock_time
+    current_effective_access_mode = evaluation.effective_access_mode
+
+    try:
+        normalized_weekday_mode_overrides = (
+            normalize_weekday_mode_overrides(weekday_mode_overrides)
+            if weekday_mode_overrides is not None
+            else normalize_weekday_mode_overrides(settings.weekday_mode_overrides)
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    next_mode_resolution = resolve_effective_access_mode(
+        settings,
+        now_local,
+        default_access_mode=normalized_access_mode,
+        weekday_mode_overrides=normalized_weekday_mode_overrides,
+    )
+    next_effective_access_mode = next_mode_resolution.access_mode
+
+    if apply_timing == APPLY_TIMING_NEXT_CYCLE:
+        if not can_defer_mode_switch(
+            current_effective_access_mode,
+            next_effective_access_mode,
+            evaluation.phase,
+            current_daily_lock_time,
+            current_first_unlock_time,
+            normalized_daily_lock_time,
+            normalized_first_unlock_time,
+        ) or current_effective_access_mode == next_effective_access_mode:
+            raise HTTPException(
+                400,
+                "只有在今日已常開、且僅於兩種首刷常開模式間切換時，才能改為今日上鎖後生效。",
+            )
+
+        settings.pending_access_mode = normalized_access_mode
+        settings.pending_weekday_mode_overrides = serialize_weekday_mode_overrides(normalized_weekday_mode_overrides)
+        description = _describe_scheduled_mode_change(
+            current_effective_access_mode,
+            evaluation.active_mode_source,
+            next_effective_access_mode,
+            next_mode_resolution.active_mode_source,
+            evaluation.weekday_key,
+            current_daily_lock_time,
+        )
+        event_action = "door_settings_scheduled"
+    else:
+        settings.access_mode = normalized_access_mode
+        settings.weekday_mode_overrides = serialize_weekday_mode_overrides(normalized_weekday_mode_overrides)
+        settings.pending_access_mode = None
+        settings.pending_weekday_mode_overrides = None
+        settings.daily_lock_time = normalized_daily_lock_time
+        settings.first_unlock_time = normalized_first_unlock_time
+
+        description = _describe_door_mode(
+            next_mode_resolution.default_access_mode,
+            next_mode_resolution.access_mode,
+            next_mode_resolution.active_mode_source,
+            next_mode_resolution.weekday_key,
+            settings.daily_lock_time,
+            settings.first_unlock_time,
+            normalized_weekday_mode_overrides,
+        )
+        event_action = "door_settings_updated"
+
+    db.add(settings)
+    db.commit()
+    db.refresh(settings)
+
+    if apply_timing == APPLY_TIMING_NEXT_CYCLE:
+        settings, evaluation, _ = sync_door_hardware_state(db, interrupt_timed_unlock=False)
+    else:
+        settings, evaluation, _ = sync_door_hardware_state(db, interrupt_timed_unlock=True)
+
+    event = DoorEvent(
+        admin_id=current_admin["id"],
+        admin_name=current_admin["name"],
+        action=event_action,
+        source="door_control_ui",
+        result="accepted",
+        description=description,
+    )
+    db.add(event)
+    db.commit()
+
+    if background_tasks:
+        background_tasks.add_task(
+            send_telegram,
+            f"🚪 門禁模式更新\n操作者：{current_admin['name']}\n{description}",
+        )
+
+    status = _build_door_status_payload(db)
+
+    return {
+        "message": description,
+        "status": status,
+        "event_id": event.id,
+    }
+
+@router.get("/door/status")
+async def get_door_status(
+    admin_token: Optional[str] = Cookie(None),
+    db: Session = Depends(get_db)
+):
+    """回傳門禁設備即時狀態與可用能力"""
+    current_admin = get_current_admin(admin_token)
+    return _build_door_status_payload(db)
+
+@router.get("/door/events")
+async def get_door_events(
+    limit: int = 20,
+    admin_token: Optional[str] = Cookie(None),
+    db: Session = Depends(get_db)
+):
+    """查詢最近的門禁控制事件"""
+    current_admin = get_current_admin(admin_token)
+
+    events = db.query(DoorEvent).order_by(DoorEvent.created_at.desc()).limit(limit).all()
+    return [{
+        "id": event.id,
+        "admin_id": event.admin_id,
+        "admin_name": event.admin_name,
+        "action": event.action,
+        "source": event.source,
+        "result": event.result,
+        "description": event.description,
+        "created_at": serialize_datetime(event.created_at),
+    } for event in events]
+
+@router.post("/door/simulate-scan")
+async def simulate_door_scan(
+    card_uid: str = Form(...),
+    admin_token: Optional[str] = Cookie(None),
+    db: Session = Depends(get_db)
+):
+    """管理後台使用的模擬刷卡入口（僅開發模式）"""
+    current_admin = get_current_admin(admin_token)
+
+    if not DEV_MODE:
+        raise HTTPException(403, "此功能僅在開發模式可用")
+
+    if not rfid_reader.dev_mode:
+        raise HTTPException(403, "RFID 讀卡機目前不在模擬模式")
+
+    card_uid = card_uid.strip()
+    if not card_uid:
+        raise HTTPException(400, "請輸入卡片 UID")
+
+    success = await rfid_reader.simulate_scan(card_uid)
+    if not success:
+        raise HTTPException(500, "RFID 讀卡機未就緒")
+
+    event = DoorEvent(
+        admin_id=current_admin["id"],
+        admin_name=current_admin["name"],
+        action="simulate_scan",
+        source="door_control_ui",
+        result="accepted",
+        description=f"已送出模擬刷卡：{card_uid}",
+    )
+    db.add(event)
+    db.commit()
+
+    log.info(f"🧪 Admin {current_admin['name']} simulated card scan: {card_uid}")
+
+    return {
+        "message": f"已模擬刷卡：{card_uid}",
+        "card_uid": card_uid,
+        "event_id": event.id,
+    }
 
 @router.get("/logs")
 async def get_access_logs(
@@ -502,23 +862,10 @@ async def get_access_logs(
 
     logs = db.query(AccessLog).order_by(AccessLog.timestamp.desc()).limit(limit).all()
 
-    # 使用 UTC+8 時區
-    tz = pytz.timezone('Asia/Taipei')
-    
     result = []
     for log_entry in logs:
         user = db.query(User).filter(User.id == log_entry.user_id).first() if log_entry.user_id else None
-        
-        # 將時間戳轉換為 UTC+8
-        if log_entry.timestamp:
-            if log_entry.timestamp.tzinfo is None:
-                timestamp_with_tz = tz.localize(log_entry.timestamp)
-            else:
-                timestamp_with_tz = log_entry.timestamp.astimezone(tz)
-            timestamp_str = timestamp_with_tz.isoformat()
-        else:
-            timestamp_str = None
-            
+
         result.append({
             "id": log_entry.id,
             "user_id": log_entry.user_id,
@@ -526,7 +873,7 @@ async def get_access_logs(
             "student_id": user.student_id if user else "N/A",
             "rfid_uid": log_entry.rfid_uid,
             "action": log_entry.action,
-            "timestamp": timestamp_str
+            "timestamp": serialize_datetime(log_entry.timestamp)
         })
 
     return result
@@ -539,24 +886,24 @@ async def get_stats(
     """獲取統計數據"""
     current_admin = get_current_admin(admin_token)
     
-    from sqlalchemy import func
-    
     # 使用 func.count() 而不是 .count()，避免查詢所有欄位
     user_count = db.query(func.count(User.id)).scalar()
     card_count = db.query(func.count(Card.id)).scalar()
     admin_count = db.query(func.count(Admin.id)).scalar()
     log_count = db.query(func.count(AccessLog.id)).scalar()
     
-    # 使用 UTC+8 時區
-    tz = pytz.timezone('Asia/Taipei')
-    now = datetime.now(tz)
-    
-    # 本月第一天（UTC+8）
-    first_day_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    
-    # 本週第一天（週一，UTC+8）
+    now = now_app_timezone()
+
+    # 本月第一天（Asia/Taipei）後再轉回 SQLite 用的 UTC naive
+    first_day_of_month = app_time_to_utc_naive(
+        now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    )
+
+    # 本週第一天（週一，Asia/Taipei）後再轉回 SQLite 用的 UTC naive
     days_since_monday = now.weekday()
-    first_day_of_week = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+    first_day_of_week = app_time_to_utc_naive(
+        (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+    )
     
     # 計算本月存取次數 - 只查詢 id 欄位
     monthly_logs = db.query(func.count(AccessLog.id)).filter(
@@ -593,9 +940,6 @@ async def update_user(
     """修改用戶資料"""
     current_admin = get_current_admin(admin_token)
 
-    # 調試日誌：查看接收到的 is_active 值
-    log.info(f"🐛 DEBUG: Received is_active = '{is_active}' (type: {type(is_active)})")
-
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(404, "用戶不存在")
@@ -615,8 +959,6 @@ async def update_user(
 
     # 將字符串轉換為 boolean
     is_active_bool = is_active.lower() in ('true', '1', 'yes')
-
-    log.info(f"🐛 DEBUG: Converted to is_active_bool = {is_active_bool}, old_active = {old_active}")
 
     user.name = name
     user.student_id = student_id

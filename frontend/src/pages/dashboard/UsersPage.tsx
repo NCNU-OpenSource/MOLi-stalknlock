@@ -8,7 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogBody, DialogFooter } from '@/components/ui/dialog'
 import { Search, Plus, Edit, Trash2, CreditCard, CheckCircle, QrCode } from 'lucide-react'
 import { userService } from '@/services/userService'
-import { registerService } from '@/services/registerService'
+import { cardBindingService } from '@/services/cardBindingService'
 import type { User } from '@/types'
 
 export const UsersPage: React.FC = () => {
@@ -109,7 +109,7 @@ export const UsersPage: React.FC = () => {
 
     try {
       // 提交到 /register 端點
-      await registerService.registerUser(
+      await cardBindingService.startBinding(
         registerFormData.studentId,
         registerFormData.name,
         registerFormData.email || undefined,
@@ -119,7 +119,7 @@ export const UsersPage: React.FC = () => {
 
       // 開始輪詢
       setRegisterStatus('binding')
-      setRegisterMessage('請在 90 秒內刷卡兩次...')
+      setRegisterMessage('請在 90 秒內刷卡兩次。綁定期間既有有效卡仍可正常通行。')
       startRegisterPolling(registerFormData.studentId)
     } catch (err: any) {
       console.error('Failed to submit registration:', err)
@@ -147,7 +147,7 @@ export const UsersPage: React.FC = () => {
     // 輪詢綁定狀態
     pollIntervalRef.current = window.setInterval(async () => {
       try {
-        const data = await registerService.checkBindingStatus(studentId)
+        const data = await cardBindingService.checkStatus(studentId)
 
         // 更新步驟
         setRegisterStep(data.step || 0)
@@ -185,7 +185,7 @@ export const UsersPage: React.FC = () => {
   if (loading) {
     return (
       <div>
-        <PageHeader title="使用者管理" description="管理使用者資料與卡片綁定" />
+        <PageHeader eyebrow="Registration" title="使用者管理" description="管理使用者資料與卡片綁定" />
         <UICard>
           <CardContent className="pt-6">
             <div className="text-center py-8 text-text-secondary">載入中...</div>
@@ -198,7 +198,7 @@ export const UsersPage: React.FC = () => {
   if (error) {
     return (
       <div>
-        <PageHeader title="使用者管理" description="管理使用者資料與卡片綁定" />
+        <PageHeader eyebrow="Registration" title="使用者管理" description="管理使用者資料與卡片綁定" />
         <UICard>
           <CardContent className="pt-6">
             <div className="text-center py-8">
@@ -214,6 +214,7 @@ export const UsersPage: React.FC = () => {
   return (
     <div>
       <PageHeader
+        eyebrow="Registration"
         title="使用者管理"
         description="管理使用者資料與卡片綁定"
         actions={
@@ -385,6 +386,11 @@ export const UsersPage: React.FC = () => {
                 </div>
 
                 <p className="text-text-secondary">{registerMessage}</p>
+                {registerStatus === 'binding' && (
+                  <p className="text-xs text-text-secondary">
+                    這次只會把尚未綁定的新卡拿來完成流程；其他已存在的有效卡片仍會照常開門。
+                  </p>
+                )}
 
                 {registerStatus === 'success' && (
                   <div className="bg-green-50 border border-green-200 rounded-lg p-4">

@@ -12,6 +12,7 @@ import { BulkActionBar } from '@/components/ui/bulk-action-bar'
 import { Search, Plus, ChevronRight, CreditCard } from 'lucide-react'
 import { userService } from '@/services/userService'
 import type { User } from '@/types'
+import { formatDate } from '@/lib/dateTime'
 
 interface FormDataType {
   name: string
@@ -92,10 +93,7 @@ export const PersonnelPage: React.FC = () => {
     if (!confirm(`確定要刪除 ${selectedIds.size} 位使用者嗎？此操作無法復原。`)) return
 
     try {
-      // TODO: 實作批量刪除 API
-      for (const id of Array.from(selectedIds)) {
-        await userService.deleteUser(id)
-      }
+      await userService.bulkDeleteUsers(Array.from(selectedIds))
       await loadUsers()
       setSelectedIds(new Set())
       alert('批量刪除成功')
@@ -324,6 +322,7 @@ export const PersonnelPage: React.FC = () => {
     return (
       <div>
         <PageHeader
+          eyebrow="Directory"
           title="人員"
           description="管理使用者資料與卡片綁定"
         />
@@ -342,6 +341,7 @@ export const PersonnelPage: React.FC = () => {
     return (
       <div>
         <PageHeader
+          eyebrow="Directory"
           title="人員"
           description="管理使用者資料與卡片綁定"
         />
@@ -360,6 +360,7 @@ export const PersonnelPage: React.FC = () => {
   return (
     <div>
       <PageHeader
+        eyebrow="Directory"
         title="人員"
         description="管理使用者資料與卡片綁定"
       />
@@ -367,27 +368,29 @@ export const PersonnelPage: React.FC = () => {
       <Card>
         <CardContent className="p-0">
           <div className="p-6 pb-0">
-            <div className="flex items-center gap-2">
-              <div className="relative flex-1">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <div className="relative min-w-0 w-full sm:flex-1">
                 <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-text-secondary" />
                 <Input
-                  placeholder="搜尋姓名、學號或信箱..."
+                  placeholder="搜尋姓名、學號、信箱"
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
                   className="pl-10 h-[34px]"
                 />
               </div>
-              <Button variant="secondary" className="flex-shrink-0 h-[34px] px-4">
-                搜尋
-              </Button>
-              <Button
-                className="gap-2 flex-shrink-0 h-[34px] px-4"
-                onClick={handleAdd}
-                style={{ backgroundColor: '#046DFF' }}
-              >
-                <Plus className="w-4 h-4" />
-                新增使用者
-              </Button>
+              <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto">
+                <Button variant="secondary" className="h-[34px] w-full px-4 sm:w-auto">
+                  搜尋
+                </Button>
+                <Button
+                  className="h-[34px] w-full gap-2 px-4 sm:w-auto"
+                  onClick={handleAdd}
+                  style={{ backgroundColor: '#046DFF' }}
+                >
+                  <Plus className="w-4 h-4" />
+                  新增使用者
+                </Button>
+              </div>
             </div>
           </div>
 
@@ -531,7 +534,7 @@ export const PersonnelPage: React.FC = () => {
                           </Badge>
                         </TableCell>
                         <TableCell className="hidden lg:table-cell text-text-secondary">
-                          {new Date(user.created_at).toLocaleDateString()}
+                          {formatDate(user.created_at)}
                         </TableCell>
                         <TableCell className="text-right">
                           <button
